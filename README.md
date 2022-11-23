@@ -1,6 +1,6 @@
 # renew-afstoken
 
-** Make AFS token renewal play nice with KCM backed Kerberos credential caches!**
+**Make AFS token renewal play nice with KCM backed Kerberos credential caches!**
 
 ## Issue
 
