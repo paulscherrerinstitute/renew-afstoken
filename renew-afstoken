@@ -1,0 +1,184 @@
+#!/bin/bash
+#
+# This script is called by pam_afs_session. It gets an initial
+# AFS token if we have a valid TGT and starts a daemon process
+# in the background to renew the AFS token as long as the TGT
+# in the credential cache is valid. Since we have persistent
+# tickets, the daemon continues running after the user logs out!
+# We start *one* daemon per PAG.
+# 
+# In the daemon loop we sleep 300 seconds. We cannot sleep longer,
+# since we otherwise may end up without a valid AFS token for
+# some time. The AFS token expires 300 seconds *after* the
+# TGT and corresponding AFS service tickets. After the KCM
+# renews the TGT we have 300 seconds to get new AFS tokens!
+
+set -o errexit    # abort on nonzero exitstatus
+set -o nounset    # abort on unbound variable
+set -o pipefail   # do not hide errors within pipes
+shopt -u failglob # abort if there is no wildcard match
+
+export LC_ALL=en_US.UTF-8
+
+STARTER_PID=$$
+VALID_KRB_CACHE=''   # managed by function select_valid_kerberos_cache
+
+check_kerberos_cache(){
+
+    local -- pag_debug_output cache
+    cache="$1"
+
+    if [[ -z ${pag_id-} ]]; then
+        pag_debug_output=''
+    else
+        pag_debug_output="PAG $pag_id, "
+    fi
+
+    # do we have a credential cache at all?
+    if ! KRB5CCNAME="$cache" /usr/bin/klist -s; then
+        echo "no Kerberos credential cache '$cache' found(${pag_debug_output}principal ${kerberos_principal})"
+        return 1
+    fi
+
+    local -- tgt_expires=''
+    local -i tgt_expires_epoch=0
+
+    # do we have a valid TGT in the credential cache?
+    tgt_expires=$(KRB5CCNAME="$cache" /usr/bin/klist | /usr/bin/awk '/krbtgt/ {print $3 " " $4}')
+    if [[ -z $tgt_expires ]]; then
+        echo "no valid Kerberos TGT found in cache '$cache' (${pag_debug_output}principal ${kerberos_principal})"
+        return 1
+    fi
+
+    tgt_expires_epoch=$(/usr/bin/date --date "${tgt_expires}" +%s)
+
+    local -- now
+    now=$(/usr/bin/date --date now +%s)
+    if (( tgt_expires_epoch <= now )); then
+        echo "no valid Kerberos TGT any more in cache '$cache', it expired on $(date --date "@$tgt_expires") (${pag_debug_output}principal ${kerberos_principal})"
+        return 1
+    fi
+
+    return 0
+}
+
+select_valid_kerberos_cache(){
+    # lets find one which is not expired and has the correct principal, e.g. out of
+    # [buchel_k@lxdev01 ~]$ klist -l
+    # Principal name                 Cache name
+    # --------------                 ----------
+    # buchel_k@D.PSI.CH              KCM:44951:50806 (Expired)
+    # buchel_k@D.PSI.CH              KCM:44951:65832 (Expired)
+    # buchel_k-adm@D.PSI.CH          KCM:44951:45055 (Expired)
+    # buchel_k@D.PSI.CH              KCM:44951:51832
+    # buchel_k@D.PSI.CH              KCM:44951:89868
+    # buchel_k@D.PSI.CH              KCM:44951:79422 (Expired)
+
+    local -- cache caches kswitch_out
+    VALID_KRB_CACHE=''
+    if caches=$(KRB5CCNAME=KCM: /usr/bin/klist -l | /usr/bin/awk '$1 == "'"${kerberos_principal}"'" && !$3 {print $2}'); then
+        for cache in $caches; do
+            if check_kerberos_cache $cache ; then
+                VALID_KRB_CACHE="$cache"
+                return 0
+            fi
+        done
+    fi
+
+    echo "# KRB5CCNAME=KCM: /usr/bin/klist"
+    KRB5CCNAME=KCM: /usr/bin/klist || true
+    echo "# KRB5CCNAME=KCM: /usr/bin/klist -l"
+    KRB5CCNAME=KCM: /usr/bin/klist -l || true
+    echo " => no valid Kerberos token of principal ${kerberos_principal}, will try again later"
+
+    return 1
+}
+
+get_token_loop(){
+    local -- loop_pid
+    loop_pid="$BASHPID"
+    while [[ ! -e "${lockfile}" || $(cat "${lockfile}") == "$STARTER_PID $loop_pid" ]]; do
+
+        # create lock file
+        if [[ ! -e "${lockfile}" ]]; then
+            if echo "$STARTER_PID $loop_pid" | tee "${lockfile}" >/dev/null 2>&1; then
+                echo "created ${lockfile} for principal ${kerberos_principal} for PID $loop_pid started by $STARTER_PID"
+            else
+                echo "could not create ${lockfile} for principal ${kerberos_principal}, try again later"
+                # if /run/user/$UID is not ready yet, so we try again next round
+            fi
+        fi
+
+        /usr/bin/sleep 270
+
+        # we can stop if there are no other processes in the PAG any more
+        # shellcheck disable=SC2207
+        # how to ignore non-existing files: https://www.gnu.org/software/gawk/manual/html_node/BEGINFILE_002fENDFILE.html
+        # despite this, I still have seen it fail, so these will be generously ignored
+        if pids=($(/usr/bin/awk "BEGINFILE {if (ERRNO) {nextfile}} /^Groups/ && /\\<${pag_id}\\>/"'{split(FILENAME, a, "/"); print a[3]}' /proc/[1-9]*/status)); then
+            echo "time to renew AFS token for PAG ${pag_id} of ${kerberos_principal} used by processes ${pids[*]}"
+            # - two renew-afstoken processes
+            # - logger process
+            # - awk
+            (( ${#pids[@]} <= 4 )) && return
+        else
+            echo "time to renew AFS token for PAG ${pag_id} of ${kerberos_principal}"
+        fi
+
+        select_valid_kerberos_cache || true
+
+        # ok, finally
+        if [[ -n $VALID_KRB_CACHE ]]; then
+            if aklog_out=$(KRB5CCNAME="$VALID_KRB_CACHE" /usr/bin/aklog -d 2>&1) ; then
+                echo "successful renewal of AFS token for PAG ${pag_id} of ${kerberos_principal} using cache '$VALID_KRB_CACHE'"
+            else
+                echo "# /usr/bin/aklog -d"
+                echo "$aklog_out"
+                echo " => failed renewal of AFS token for PAG ${pag_id} of ${kerberos_principal} using cache '$VALID_KRB_CACHE', will try again later"
+            fi
+        fi
+    done
+
+}
+
+# get the default principal
+if ! kerberos_principal=$(/usr/bin/klist | /usr/bin/awk '/^Default principal/ {print $3}'); then
+    echo "# /usr/bin/klist" | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+    /usr/bin/klist 2>&1 | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+    echo " => no Kerberos default principal found" | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+    exit 1
+fi
+
+select_valid_kerberos_cache || true | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+
+# We need to have a token before this script terminates.
+# This cannot be moved into the while-loop!
+if ! aklog_out=$(KRB5CCNAME="${VALID_KRB_CACHE-'KCM:'}" /usr/bin/aklog -d 2>&1) ; then
+    echo "# KRB5CCNAME="${VALID_KRB_CACHE-'KCM:'}" /usr/bin/aklog -d" | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+    echo -- "$aklog_out" | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+    echo " => could not get the AFS token for ${kerberos_principal} using cache" | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+    exit 1
+fi
+
+# get PAG ID and exit if we are NOT in a PAG.
+pag_id=$(/usr/bin/id -G | /usr/bin/awk '{print $NF}')
+if (( pag_id < 1000000000 )); then
+    echo "no AFS PAG found for ${kerberos_principal}" | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+    exit 1
+fi
+
+# is there already a daemon running?
+lockfile="/run/user/$(/usr/bin/id -u)/renew-afstoken_for_pag_${pag_id}"
+
+{
+    _exit(){
+        echo "terminating and removing lockfile '${lockfile}' of ${kerberos_principal}" | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+        /usr/bin/rm -f "${lockfile}" || true
+        # kill all spawed processes
+        jobs -p | xargs --no-run-if-empty kill
+    }
+    trap '_exit' EXIT
+
+    get_token_loop 2>&1 | /usr/bin/logger --tag "$0" --id=$STARTER_PID
+} &
+disown
