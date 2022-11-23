@@ -9,8 +9,9 @@ due to the KCM not always selecting an appropriate default credential cache. We 
 
 ## Solution
 The `renew-afstoken` script is started as background process doing regular token renewal and for authentication selecting a suitable credential cache out of all caches provided by the KCM. It can be run in place of `aklog`.
+Is no suitable Kerberos ticket available it will try later and reauthenticate as soon as one is available again.
 
-When AFS is set up in PAM, following configuration can be used with [OpenAFS](http://www.openafs.org/):
+If AFS is set up in PAM, following configuration can be used with [OpenAFS](http://www.openafs.org/):
 
 ```
 session     optional      pam_afs_session.so always_aklog program=/usr/local/bin/renew-afstoken
